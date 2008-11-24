@@ -73,6 +73,9 @@
 
 (defvar ss-host 'local)
 
+(defvar ss-default-404-page
+  "<html><head><title>404</title></head><body><center><h2>404 Not Found</h2></center></body></html>")
+
 (defvar ss-request
   `((host . ,ss-host)
     (method . nil)
@@ -81,6 +84,69 @@
 request, and should only be accessed through the
 `ss-request-host', `ss-request-method', and `ss-request-uri'
 functions." )
+
+(defvar ss-http-headers
+  '((status . 200)
+    (connection . "close")
+    (type . "html")
+    (server . "Emacs/simple-server.el"))
+  "Alist of http headers")
+
+(defvar ss-http-status-codes
+  '((200 . "OK")
+    (301 . "Moved permanently")
+    (302 . "Moved temporarily")
+    (400 . "Bad request")
+    (403 . "Forbidden")
+    (404 . "Not found")
+    (405 . "Method not allowed")
+    (500 . "Internal server error")
+    (501 . "Not implemented")
+    (503 . "Service unavailable"))
+  "Alist of http status codes and their meanings")
+
+(defvar ss-mime-types
+  '(("html" . "text/html; charset=utf-8")
+    ("txt"  . "text/plain; charset=utf-8")
+    ("css"  . "text/css")
+    ("jpg"  . "image/jpeg")
+    ("jpeg" . "image/jpeg")
+    ("gif"  . "image/gif")
+    ("png"  . "image/png")
+    ("tif"  . "image/tiff")
+    ("tiff" . "image/tiff")
+    ("gz"   . "application/octet-stream")
+    ("ps"   . "application/postscript")
+    ("pdf"  . "application/pdf")
+    ("eps"  . "application/postscript")
+    ("tar"  . "application/x-tar")
+    ("rpm"  . "application/x-rpm")
+    ("zip"  . "application/zip")
+    ("mp3"  . "audio/mpeg")
+    ("mp2"  . "audio/mpeg")
+    ("mid"  . "audio/midi")
+    ("midi" . "audio/midi")
+    ("wav"  . "audio/x-wav")
+    ("au"   . "audio/basic")
+    ("ram"  . "audio/pn-realaudio")
+    ("ra"   . "audio/x-realaudio")
+    ("mpg"  . "video/mpeg")
+    ("mpeg" . "video/mpeg")
+    ("qt"   . "video/quicktime")
+    ("mov"  . "video/quicktime")
+    ("avi"  . "video/x-msvideo")))
+
+(defvar ss-default-page
+"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"
+	\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">
+<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"en\" lang=\"en\">
+<head><title>Simple Server is up and running</title></head>
+<body><h2>Simple Server</h2>
+<p><b>Simple Server</b> is a VERY simple web-server written entirely<br>
+in emacs lisp.  This is made possible thanks to the addition of<br>
+server-sockets to emacs via the `make-network-process' command.<br></p>
+<p>I would not recommend actually using this in anything even<br>
+resembling a production environment.</p></body></html>\n")
 
 (defvar ss-dispatch-table
   '((lambda ()
@@ -123,10 +189,10 @@ page.")
   "restart the emacs simple server"
   (interactive) (simple-server-stop) (simple-server-start))
 
-;;; Implementation:
+;;; Process Implementation:
 (defun ss-filter (proc string)   
   (let ((pending (assoc proc ss-clients))
-        message index)
+        message index responce)
     ;;create entry if required
     (unless pending
       (setq ss-clients (cons (cons proc "") ss-clients))
@@ -135,7 +201,7 @@ page.")
     (while (setq index (string-match "\n" message)) ;; this is the main server loop
       ;; collect the request
       (setq index (1+ index))
-      (ss-log  (substring message 0 index) "out" proc)
+      (ss-log  (substring message 0 index) "in" proc)
       ;; find the route
       (when (string-match "GET \\([^ ]+\\) HTTP" message)
 	(setf (cdr (assoc 'uri ss-request)) (match-string 1 message))
@@ -143,7 +209,8 @@ page.")
       ;; when the request ends reply
       (when (string-equal "\r\n" message)
 	(process-send-string proc (ss-serve))
-	(delete-process proc))
+	(unless (string= "keep-alive" (ss-get-header 'connection))
+	  (delete-process proc)))
       (setq message (substring message index)))
     (setcdr pending message)))
 
@@ -161,7 +228,11 @@ page.")
 		string)
 	(or (bolp) (newline)))))
 
-;;; Request:
+(defun ss-create-log ()
+  (interactive)
+  (get-buffer-create ss-log))
+
+;;; Utility Functions:
 (defun ss-request-host ()
   "returns the host name of the request"
   (cdr (assoc 'host ss-request)))
@@ -174,77 +245,68 @@ page.")
   "returns the path of the uri following the"
   (cdr (assoc 'uri ss-request)))
 
+(defun ss-set-header (header value)
+  (let ((pair (assoc header ss-http-headers)))
+    (setf (cdr pair) value)))
+
+(defun ss-reset-http-headers ()
+  (mapcar (lambda (pair)
+	    (ss-set-header (car pair) (cdr pair)))
+	  '((status . 200)
+	    (connection . "close")
+	    (type . "html")
+	    (server . "Emacs/simple-server.el"))))
+
+(defun ss-get-header (header)
+  (cdr (assoc header ss-http-headers)))
+
+(defun ss-expand-status (code)
+  (cdr (assoc code ss-http-status-codes)))
+
+(defun ss-expand-mime (mime-type)
+  (cdr (assoc mime-type ss-mime-types)))
+
+(defun ss-http-header (&optional content-length)
+  "Return a string of the http header based upon the contents of
+`ss-http-headers'"
+  (let* ((endl "\r\n")
+	 (status (ss-get-header 'status))
+	 (long-status (ss-expand-status status))
+	 (status-str (int-to-string status))
+	 (connection (ss-get-header 'connection))
+	 (type (ss-get-header 'type))
+	 (long-type (ss-expand-mime type))
+	 (server (ss-get-header 'server))
+	 (date (format-time-string "%a, %d %b %Y %H:%M:%S %Z")))
+    (concat
+     "HTTP/1.1 " status-str " " long-status endl
+     "Connection: " connection endl
+     "Date: " date endl
+     "Status: " status-str " " long-status endl
+     "Server: " server endl
+     "Content-Type: " long-type endl
+     (if content-length (format "Content-Length: %d%s" content-length endl))
+     endl)))
+
 (defun ss-serve ()
-  "This function should take a route, and using the functions in
-the `ss-dispatch-table' it will try to handle the
-request.  This function will then wrap any responce as
-appropriate and return it as a string to be given directly to the
-process."
-  (let (handler)
-    ;; set the request object
+  "This function cycles through the functions in the
+`ss-dispatch-table' until one returns a handler.  The handler is
+then called and the result is wrapped in header information and
+passed to the http client.
+
+Default header information is specified in `ss-reset-http-headers'.
+To change header information a handler should change the values
+of `ss-http-headers' using `ss-set-header'."
+  (let (handler result)
     (dolist (dispatcher ss-dispatch-table)
       (when (null handler)
 	(setf handler (funcall dispatcher))))
-    (message (format "%S" handler))
-    (if handler
-	(concat "HTTP/1.1 200 OK
-Connection: close
-Status: 200 OK
-Server: Emacs SimpleServer
-Content-Type: text/html; charset=utf-8\n\n"
-		(funcall handler)
-;;;             ;; Error handling
-;;; 		(condition-case err
-;;; 		    (funcall handler)
-;;; 		  "HTTP/1.1 500 Server Error
-;;; Connection: close
-;;; Status: 500 Server Error
-;;; Server: Emacs SimpleServer\n\n")
-		)
-		  "HTTP/1.1 404 Not Found
-Connection: close
-Status: 404 Not Found
-Server: Emacs SimpleServer\n\n")))
-
-;;; Specifying Content
-;;
-;;; All Possible Headers
-;; HTTP/1.1 200 OK
-;; Connection: close
-;; Date: Wed, 19 Nov 2008 01:40:26 GMT
-;; Set-Cookie: _emacs_session=076da85608ca541e04dbe1e276505cd9; path=/
-;; Status: 200 OK
-;; X-Runtime: 0.02498
-;; ETag: \"662c5a2975130ea13d1c2acae196ae72\"
-;; Cache-Control: private, max-age=0, must-revalidate
-;; Server: Mongrel 1.1.5
-;; Content-Type: text/html; charset=utf-8
-;; Content-Length: 78435
-(defvar ss-default-page
-"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"
-	\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">
-<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"en\" lang=\"en\">
-<head>
-<title>Simple Server is up and running</title>
-</head>
-<body>
-<h2>Simple Server</h2>
-<p>
-<b>Simple Server</b> is a VERY simple web-server written entirely<br>
-in emacs lisp.  This is made possible thanks to the addition of<br>
-server-sockets to emacs via the `make-network-process' command.<br>
-</p>
-<p>
-I would not recommend actually using this in anything even<br>
-resembling a production environment.
-</p>
-<p>
-Now using a dispatch table.
-</p>
--- schulte
-</body>
-</html>\n"
-"This is the default page for the Emacs simple-server web server.")
+    (ss-reset-http-headers)
+    (if (and handler (setf result (funcall handler)))
+	(progn
+	  (ss-log (ss-http-header (length result)) "header:\n")
+	  (concat (ss-http-header (length result)) result))
+      (concat (and (ss-set-header 'status 404) (ss-http-header) ss-default-404-page)))))
 
 (provide 'simple-server)
 ;;; simple-server.el ends here
